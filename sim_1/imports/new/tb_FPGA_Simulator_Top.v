@@ -16,6 +16,7 @@ module tb_FPGA_Simulator_Top;
     reg FPGA_RST_BTN;
     reg [7:0] FPGA_SWITCHES;
     reg FPGA_SEND_BTN;
+    reg FPGA_ADD_PACKET_BTN;
     reg [2:0] KEYPAD_COL;
 
     // DUT 출력
@@ -31,6 +32,7 @@ module tb_FPGA_Simulator_Top;
         .FPGA_RST_BTN(FPGA_RST_BTN),
         .FPGA_SWITCHES(FPGA_SWITCHES),
         .FPGA_SEND_BTN(FPGA_SEND_BTN),
+        .FPGA_ADD_PACKET_BTN(FPGA_ADD_PACKET_BTN),
         .KEYPAD_COL(KEYPAD_COL),
         .KEYPAD_ROW(KEYPAD_ROW),
         .FPGA_LEDS(FPGA_LEDS),
@@ -45,7 +47,7 @@ module tb_FPGA_Simulator_Top;
         FPGA_CLK = 0;
         forever #1 FPGA_CLK = ~FPGA_CLK;
     end
-
+    integer i;
     // 테스트 시나리오
     initial begin
         $display("==================================================");
@@ -56,6 +58,7 @@ module tb_FPGA_Simulator_Top;
         FPGA_RST_BTN = 1'b0; // Active-Low 리셋 버튼 누름
         FPGA_SWITCHES = 8'h00;
         FPGA_SEND_BTN = 1'b0;
+        FPGA_ADD_PACKET_BTN = 1'b0;
         KEYPAD_COL = 3'b000; // 키패드 입력 없음
         
         #10; // 리셋 안정화 시간
@@ -64,49 +67,109 @@ module tb_FPGA_Simulator_Top;
         $display("[%0t] System Reset Released.", $time);
 
         // 2. 페이로드 설정 (키패드 '5' 입력 시뮬레이션)
-        // Keypad.v 분석: '5'는 Row 1, Col 1에 해당.
-        // dut가 KEYPAD_ROW를 4'b0100 (Row 1 활성화)으로 만들 때,
-        // KEYPAD_COL을 3'b010 (Col 1 활성화)으로 설정하여 키 입력을 시뮬레이션.
         $display("[%0t] Waiting to simulate keypad press for payload '5'...", $time);
         wait (dut.KEYPAD_ROW == 4'b0100); // Row 1이 스캔될 때까지 대기
-        #1; // 안정성을 위해 약간의 지연
+        #1;
         KEYPAD_COL = 3'b010; // '5' 키에 해당하는 열을 활성화
-        #15; // 키가 눌린 상태를 몇 클럭 동안 유지
-        KEYPAD_COL = 3'b000; // 키를 뗌 (모든 열 비활성화)
+        #15;
+        KEYPAD_COL = 3'b000; // 키를 뗌
         $display("[%0t] Keypad '5' pressed. Payload should be updated.", $time);
-        #10; // 페이로드 값이 업데이트될 시간을 줌
+        #10;
 
         // 페이로드 값 확인 (LED 하위 4비트)
-        if (FPGA_LEDS[3:0] == 4'h5) $display("[SUCCESS] Payload is correctly set to 5. (LEDS[3:0]=%h)", FPGA_LEDS[3:0]);
-        else $display("[FAILURE] Payload is NOT set correctly. (LEDS[3:0]=%h)", FPGA_LEDS[3:0]);
+        if (FPGA_LEDS[3:0] == 4'h5)
+            $display("[SUCCESS] Payload is correctly set to 5. (LEDS[3:0]=%h)", FPGA_LEDS[3:0]);
+        else
+            $display("[FAILURE] Payload is NOT set correctly. (LEDS[3:0]=%h)", FPGA_LEDS[3:0]);
 
-        // 3. 프레임 전송 (Node A -> Node C)
-        // DIP 스위치 설정: DST=C(1100), SRC=A(1010)
-        FPGA_SWITCHES = 8'hCA;
-        #10;
-        $display("[%0t] Set Switches: DST=C, SRC=A (FPGA_SWITCHES = 8'h%h)", $time, FPGA_SWITCHES);
+        // 3. 패킷 추가 (여러 패킷을 큐에 쌓음)
+        // 첫 번째 패킷: DST=C, SRC=A, payload=5
+        FPGA_SWITCHES = 8'hCA; // DST=C(1100), SRC=A(1010)
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b1;
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b0;
+        #30; // 안정화 대기
+        $display("[%0t] Packet 1 added: DST=C, SRC=A, Payload=5", $time);
 
-        // 전송 버튼 누르기 (1 클럭 사이클 동안)
+        // 두 번째 패킷: DST=D, SRC=B, payload=5
+        FPGA_SWITCHES = 8'hDB; // DST=D(1101), SRC=B(1011)
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b1;
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b0;
+        #30; // 안정화 대기
+        $display("[%0t] Packet 2 added: DST=D, SRC=B, Payload=5", $time);
+
+        // 세 번째 패킷: DST=A, SRC=C, payload=5
+        FPGA_SWITCHES = 8'hAC; // DST=A(1010), SRC=C(1100)
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b1;
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b0;
+        #30; // 안정화 대기
+        $display("[%0t] Packet 3 added: DST=A, SRC=C, Payload=5", $time);
+
+        $display("[%0t] All packets queued. Ready to send.", $time);
+
+        // 전송 버튼 누르기
         FPGA_SEND_BTN = 1'b1;
-        #20; // 1 클럭 (20ns) 동안 버튼 누름
+        #20;
         FPGA_SEND_BTN = 1'b0;
-        $display("[%0t] Send button pressed. Frame transmission from A to C initiated.", $time);
+        $display("[%0t] Send button pressed. All queued frames transmitted.", $time);
 
         // 4. 시뮬레이션 진행 및 종료
         #500; // 스위치를 통해 프레임이 전달되고 LED가 업데이트될 충분한 시간
 
-        // 최종 결과 확인: Payload는 5, 수신 노드는 C (LED[6]=1)
-        // FPGA_LEDS 예상 값: 8'b0100_0101 = 8'h45
-        if (FPGA_LEDS == 8'h45)
-            $display("[SUCCESS] Final LED value is correct: %h. Frame successfully received by Node C.", FPGA_LEDS);
+        // 최종 결과 확인
+        // 수신 노드: A(LED[4]), C(LED[6]), D(LED[7]) => LED[7:4] = 4'b1101 = 0xD
+        // payload = 5 => LED[3:0] = 0x5
+        $display("[%0t] Final FPGA_LEDS = %h", $time, FPGA_LEDS);
+        if (FPGA_LEDS[7:4] == 4'b1101)
+            $display("[SUCCESS] Receive LEDs correct: LED[7:4]=%b (A,C,D received)", FPGA_LEDS[7:4]);
         else
-            $display("[FAILURE] Final LED value is incorrect: %h. Expected 8'h45.", FPGA_LEDS);
+            $display("[FAILURE] Receive LEDs incorrect: LED[7:4]=%b, Expected 1101", FPGA_LEDS[7:4]);
+
+        // 첫 번째 패킷: DST=C, SRC=D, payload=5
+        FPGA_SWITCHES = 8'hCD; // DST=C(1100), SRC=D(1011)
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b1;
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b0;
+        #30; // 안정화 대기
+        $display("[%0t] Packet 1 added: DST=C, SRC=D, Payload=5", $time);
+
+        // 두 번째 패킷: DST=D, SRC=B, payload=5
+        FPGA_SWITCHES = 8'hDB; // DST=D(1101), SRC=B(1011)
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b1;
+        #20;
+        FPGA_ADD_PACKET_BTN = 1'b0;
+        #30; // 안정화 대기
+        $display("[%0t] Packet 2 added: DST=D, SRC=B, Payload=5", $time);
+
+        $display("[%0t] All packets queued. Ready to send.", $time);
+
+        // 전송 버튼 누르기
+        FPGA_SEND_BTN = 1'b1;
+        #20;
+        FPGA_SEND_BTN = 1'b0;
+        $display("[%0t] Send button pressed. All queued frames transmitted.", $time);
+
+        // 4. 시뮬레이션 진행 및 종료
+        #500; // 스위치를 통해 프레임이 전달되고 LED가 업데이트될 충분한 시간
+
+        // 최종 결과 확인
+        // 수신 노드: A(LED[4]), C(LED[6]), D(LED[7]) => LED[7:4] = 4'b1101 = 0xD
+        // payload = 5 => LED[3:0] = 0x5
+        $display("[%0t] Final FPGA_LEDS = %h", $time, FPGA_LEDS);
+        if (FPGA_LEDS[7:4] == 4'b1100)
+            $display("[SUCCESS] Receive LEDs correct: LED[7:4]=%b (C,D received)", FPGA_LEDS[7:4]);
+        else
+            $display("[FAILURE] Receive LEDs incorrect: LED[7:4]=%b, Expected 1100", FPGA_LEDS[7:4]);
 
         $display("[%0t] Simulation finished.", $time);
         $finish;
     end
-
-    // 모니터링
-
 
 endmodule

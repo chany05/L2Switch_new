@@ -41,7 +41,8 @@ module TX_Unit #(
     input rst,
     input [DEPTH-1:0] tx_frame, // 프레임 입력
     input frame_tx_valid,       // 프레임 전송 유효 신호
-    output tx_bit              // 시프트 아웃 비트
+    output tx_bit,              // 시프트 아웃 비트
+    output tx_busy              // 전송 중 표시
 );
     wire tx_shift_out_bit;
     reg tx_load_en;  // 프레임 로드 신호
@@ -93,7 +94,8 @@ module TX_Unit #(
         .shift_out(tx_shift_out_bit)
     );
 
-    assign tx_bit = tx_shift_en ? tx_shift_out_bit : 1'b1; // 전송 중이 아닐 때는 하이 임피던스(z) 상태로 전환
+    assign tx_bit = tx_shift_en ? tx_shift_out_bit : 1'b1;
+    assign tx_busy = (tx_state == TX_SHIFT);  // 전송 중이면 busy
 endmodule
 
 //================================================================

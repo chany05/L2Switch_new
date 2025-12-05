@@ -179,6 +179,7 @@ module FPGA_Simulator_Top (
     L2_Switch dut_switch (
         .clk(FPGA_CLK),
         .rst(sys_rst),
+        .clear_fifos(send_trigger),
         .rx_bit_in(rx_bit_from_nodes),
         .tx_bit_out(tx_bit_to_nodes)
     );

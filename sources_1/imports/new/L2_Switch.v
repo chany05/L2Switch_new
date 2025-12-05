@@ -20,6 +20,7 @@ module Simple_FIFO #(
 )(
     input clk,
     input rst,
+    input flush,  // FIFO 초기화 신호
     // Write Port
     input wr_en,
     input [DATA_WIDTH-1:0] wr_data,
@@ -40,7 +41,7 @@ module Simple_FIFO #(
     assign rd_data = mem[rd_ptr[ADDR_WIDTH-1:0]];
 
     always @(posedge clk or posedge rst) begin
-        if (rst) begin
+        if (rst || flush) begin
             wr_ptr <= 0;
             rd_ptr <= 0;
             count <= 0;
@@ -73,6 +74,7 @@ module Switch_Port #(
 )(
     input clk,
     input rst,
+    input fifo_flush,  // FIFO 초기화 신호
     
     // 외부 물리적 연결
     input rx_bit_in,
@@ -87,6 +89,7 @@ module Switch_Port #(
     // FIFO와 TX Unit 연결을 위한 내부 신호
     wire [DEPTH-1:0] fifo_rd_data;
     wire fifo_empty;
+    wire tx_busy;  // TX Unit busy 신호
     reg [DEPTH-1:0] tx_frame_to_unit;
     reg frame_tx_valid_to_unit;
 
@@ -109,10 +112,11 @@ module Switch_Port #(
         .FIFO_DEPTH(FIFO_DEPTH)
     ) u_fifo (
         .clk(clk), .rst(rst),
+        .flush(fifo_flush),
         .wr_en(fifo_wr_en_in),
         .wr_data(fifo_wr_data_in),
-        .full(), // full 신호는 현재 사용하지 않음
-        .rd_en(!fifo_empty && !frame_tx_valid_to_unit), // TX 유닛이 유휴 상태일 때만 읽기
+        .full(),
+        .rd_en(!fifo_empty && !tx_busy && !frame_tx_valid_to_unit),  // TX 완료 후에만 읽기
         .rd_data(fifo_rd_data),
         .empty(fifo_empty)
     );
@@ -124,7 +128,8 @@ module Switch_Port #(
         .clk(clk), .rst(rst),
         .tx_frame(tx_frame_to_unit),
         .frame_tx_valid(frame_tx_valid_to_unit),
-        .tx_bit(tx_bit_out)
+        .tx_bit(tx_bit_out),
+        .tx_busy(tx_busy)
     );
 
     // FIFO에서 데이터를 읽어 TX Unit으로 전달하는 로직
@@ -134,7 +139,8 @@ module Switch_Port #(
             frame_tx_valid_to_unit <= 0;
         end else begin
             frame_tx_valid_to_unit <= 0; // 기본적으로 0으로 유지
-            if (!fifo_empty && !frame_tx_valid_to_unit) begin
+            // TX가 idle 상태이고 FIFO에 데이터가 있으면 전송
+            if (!fifo_empty && !tx_busy && !frame_tx_valid_to_unit) begin
                 tx_frame_to_unit <= fifo_rd_data;
                 frame_tx_valid_to_unit <= 1;
             end
@@ -143,17 +149,18 @@ module Switch_Port #(
 endmodule
 
 //================================================================
-// L2 Switch Main Module
+// L2 Switch Main Module (Round-Robin Scheduling)
 //================================================================
 module L2_Switch #(
     parameter NUM_PORTS = 4,
     parameter DEPTH = 16,
     parameter ADDR_WIDTH = 4,
-    parameter TABLE_SIZE = 16, // MAC 테이블 크기
+    parameter TABLE_SIZE = 16,
     parameter FIFO_DEPTH = 8
 )(
     input clk,
     input rst,
+    input clear_fifos,  // 모든 FIFO 초기화 신호
     input [NUM_PORTS-1:0] rx_bit_in,
     output [NUM_PORTS-1:0] tx_bit_out
 );
@@ -174,36 +181,49 @@ module L2_Switch #(
     reg [ADDR_WIDTH-1:0] mac_table_addr [0:TABLE_SIZE-1];
     reg [$clog2(NUM_PORTS)-1:0] mac_table_port [0:TABLE_SIZE-1];
     reg mac_table_valid [0:TABLE_SIZE-1];
-    reg [$clog2(TABLE_SIZE)-1:0] mac_table_next_idx; // [Refactor] 다음 저장 위치 포인터
-
-    // Main switching logic을 위한 임시 변수 (모듈 레벨에 선언)
-    reg [ADDR_WIDTH-1:0] src_mac;
-    reg [ADDR_WIDTH-1:0] dest_mac;
-    wire dest_found; // [Refactor] 조합 논리로 변경
-    reg [$clog2(NUM_PORTS)-1:0] dest_port;
-    integer i, j;
+    reg [$clog2(TABLE_SIZE)-1:0] mac_table_next_idx;
 
     // FIFO interface signals
-    wire [DEPTH-1:0] fifo_rd_data [0:NUM_PORTS-1];
-    wire fifo_empty [0:NUM_PORTS-1];
     reg fifo_wr_en [0:NUM_PORTS-1];
     reg [DEPTH-1:0] fifo_wr_data [0:NUM_PORTS-1];
 
-    // [Refactor] MAC 테이블 검색을 위한 신호
-    reg [ADDR_WIDTH-1:0] lookup_mac;
-    wire lookup_found;
+    // ============================================================
+    // Round-Robin Scheduler 관련 신호
+    // ============================================================
+    reg [$clog2(NUM_PORTS)-1:0] rr_current_port;  // 현재 처리 중인 포트
+    
+    // 각 포트별 입력 큐 (수신된 프레임 저장)
+    reg [DEPTH-1:0] input_queue [0:NUM_PORTS-1];
+    reg input_queue_valid [0:NUM_PORTS-1];
+    
+    // 포워딩 상태 머신
+    localparam S_IDLE = 2'd0;
+    localparam S_LOOKUP = 2'd1;
+    localparam S_FORWARD = 2'd2;
+    localparam S_FLOOD = 2'd3;
+    
+    reg [1:0] fwd_state;
+    reg [DEPTH-1:0] current_frame;
+    reg [$clog2(NUM_PORTS)-1:0] current_src_port;
+    reg [ADDR_WIDTH-1:0] current_dest_mac;
+    reg [ADDR_WIDTH-1:0] current_src_mac;
+    reg [$clog2(NUM_PORTS)-1:0] flood_port_idx;  // Flooding 시 현재 처리 중인 포트
+    reg [$clog2(NUM_PORTS)-1:0] dest_port_reg;
+    reg dest_found_reg;
+
+    integer i, j;
 
     // Generate RX, FIFO, TX units for each port
     genvar port_idx;
     generate
         for (port_idx = 0; port_idx < NUM_PORTS; port_idx = port_idx + 1) begin : port_inst
-            // 각 포트를 구성하는 Switch_Port 모듈을 인스턴스화
             Switch_Port #(
                 .DEPTH(DEPTH),
                 .ADDR_WIDTH(ADDR_WIDTH),
                 .FIFO_DEPTH(FIFO_DEPTH)
             ) u_switch_port (
                 .clk(clk), .rst(rst),
+                .fifo_flush(clear_fifos),
                 .rx_bit_in(rx_bit_in[port_idx]),
                 .tx_bit_out(tx_bit_out[port_idx]),
                 .rx_frame_out(rx_frame[port_idx]),
@@ -214,100 +234,160 @@ module L2_Switch #(
         end
     endgenerate
 
-    // [Refactor Block 1] MAC Address Learning Logic
+    // ============================================================
+    // 입력 큐에 수신 프레임 저장 (각 포트별로 독립 동작)
+    // ============================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            for (i = 0; i < NUM_PORTS; i = i + 1) begin
+                input_queue[i] <= 0;
+                input_queue_valid[i] <= 0;
+            end
+        end else begin
+            for (i = 0; i < NUM_PORTS; i = i + 1) begin
+                if (frame_rx_valid[i] && !input_queue_valid[i]) begin
+                    // 프레임 수신 시 입력 큐에 저장
+                    input_queue[i] <= rx_frame[i];
+                    input_queue_valid[i] <= 1;
+                end
+                // 큐가 처리되면 valid 플래그 해제 (아래 FSM에서 처리)
+            end
+        end
+    end
+
+    // ============================================================
+    // MAC Address Learning (수신 시 즉시 학습)
+    // ============================================================
+    reg src_found;
+    reg [ADDR_WIDTH-1:0] src_mac_local [0:NUM_PORTS-1];
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             for (i = 0; i < TABLE_SIZE; i = i + 1) begin
                 mac_table_valid[i] <= 0;
+                mac_table_addr[i] <= 0;
+                mac_table_port[i] <= 0;
             end
             mac_table_next_idx <= 0;
         end else begin
-            // 모든 포트를 순회하며 프레임 수신 시 MAC 주소 학습
             for (i = 0; i < NUM_PORTS; i = i + 1) begin
                 if (frame_rx_valid[i]) begin
-                    reg src_found;
-                    src_mac = rx_frame[i][SRC_ADDR_MSB:SRC_ADDR_LSB];
-
-                    // 1. 테이블에서 Source MAC 검색
+                    src_mac_local[i] = rx_frame[i][SRC_ADDR_MSB:SRC_ADDR_LSB];
                     src_found = 0;
                     for (j = 0; j < TABLE_SIZE; j = j + 1) begin
-                        if (mac_table_valid[j] && mac_table_addr[j] == src_mac) begin
+                        if (mac_table_valid[j] && mac_table_addr[j] == src_mac_local[i]) begin
                             src_found = 1;
-                            // Optional: 장치가 다른 포트로 이동한 경우, 포트 정보 업데이트
                             if (mac_table_port[j] != i) begin
                                 mac_table_port[j] <= i;
                             end
                         end
                     end
-
-                    // 2. 테이블에 없으면 새로 추가 (개선된 방식)
                     if (!src_found) begin
-                        mac_table_addr[mac_table_next_idx] <= src_mac;
+                        mac_table_addr[mac_table_next_idx] <= src_mac_local[i];
                         mac_table_port[mac_table_next_idx] <= i;
                         mac_table_valid[mac_table_next_idx] <= 1;
-                        mac_table_next_idx <= mac_table_next_idx + 1; // 다음 인덱스로 이동
+                        mac_table_next_idx = mac_table_next_idx + 1;
                     end
                 end
             end
         end
     end
 
-    // [Refactor Block 2] Frame Forwarding Logic
+    // ============================================================
+    // Round-Robin 포워딩 FSM
+    // ============================================================
     always @(posedge clk or posedge rst) begin
         if (rst) begin
+            rr_current_port <= 0;
+            fwd_state <= S_IDLE;
+            current_frame <= 0;
+            current_src_port <= 0;
+            current_dest_mac <= 0;
+            current_src_mac <= 0;
+            flood_port_idx <= 0;
+            dest_port_reg <= 0;
+            dest_found_reg <= 0;
             for (i = 0; i < NUM_PORTS; i = i + 1) begin
                 fifo_wr_en[i] <= 0;
                 fifo_wr_data[i] <= 0;
             end
         end else begin
-            // 기본적으로 모든 FIFO 쓰기 비활성화
+            // 기본적으로 FIFO 쓰기 비활성화
             for (i = 0; i < NUM_PORTS; i = i + 1) begin
                 fifo_wr_en[i] <= 0;
             end
-
-            // 모든 포트를 순회하며 프레임 포워딩 결정
-            for (i = 0; i < NUM_PORTS; i = i + 1) begin
-                if (frame_rx_valid[i]) begin
-                    reg dest_found_local = 0; // always 블록 내에서 사용할 임시 변수, 0으로 초기화
-                    dest_mac = rx_frame[i][DEST_ADDR_MSB:DEST_ADDR_LSB];
-
-                    // 1. 테이블에서 Destination MAC 검색하여 포트 찾기
-                    dest_port = 0; // 기본값
-                    // dest_found_local = 0; // 선언과 동시에 초기화하므로 이 라인은 제거 가능
-                    for (j = 0; j < TABLE_SIZE; j = j + 1) begin
-                        if (mac_table_valid[j] && mac_table_addr[j] == dest_mac) begin
-                            dest_port = mac_table_port[j];
-                            dest_found_local = 1;
-                        end
-                    end 
-
-                    // 2. 포워딩 규칙 적용
-                    if (dest_mac == BROADCAST_ADDR) begin
-                        // Case A: Broadcast -> Flooding
-                        for (j = 0; j < NUM_PORTS; j = j + 1) begin
-                            if (i != j) begin // 수신 포트 제외
-                                fifo_wr_en[j] <= 1;
-                                fifo_wr_data[j] <= rx_frame[i];
-                            end
-                        end
-                    end else if (dest_found_local) begin
-                        // Case B: Unicast (주소 찾음)
-                        if (dest_port != i) begin // 목적지가 수신 포트와 다르면 -> Forwarding
-                            fifo_wr_en[dest_port] <= 1;
-                            fifo_wr_data[dest_port] <= rx_frame[i];
-                        end
-                        // 목적지가 수신 포트와 같으면 -> Filtering (아무것도 안 함)
+            
+            case (fwd_state)
+                S_IDLE: begin
+                    // Round-Robin으로 처리할 포트 선택
+                    if (input_queue_valid[rr_current_port]) begin
+                        // 현재 포트에 처리할 프레임이 있음
+                        current_frame <= input_queue[rr_current_port];
+                        current_src_port <= rr_current_port;
+                        current_dest_mac <= input_queue[rr_current_port][DEST_ADDR_MSB:DEST_ADDR_LSB];
+                        current_src_mac <= input_queue[rr_current_port][SRC_ADDR_MSB:SRC_ADDR_LSB];
+                        fwd_state <= S_LOOKUP;
                     end else begin
-                        // Case C: Unicast (주소 못 찾음) -> Flooding
-                        for (j = 0; j < NUM_PORTS; j = j + 1) begin
-                            if (i != j) begin // 수신 포트 제외
-                                fifo_wr_en[j] <= 1;
-                                fifo_wr_data[j] <= rx_frame[i]; // 원본 프레임을 그대로 전달
-                            end
-                        end
+                        // 다음 포트로 이동
+                        rr_current_port <= (rr_current_port + 1) % NUM_PORTS;
                     end
                 end
-            end
+                
+                S_LOOKUP: begin
+                    // MAC 테이블에서 목적지 검색
+                    dest_found_reg <= 0;
+                    dest_port_reg <= 0;
+                    for (j = 0; j < TABLE_SIZE; j = j + 1) begin
+                        if (mac_table_valid[j] && mac_table_addr[j] == current_dest_mac) begin
+                            dest_port_reg <= mac_table_port[j];
+                            dest_found_reg <= 1;
+                        end
+                    end
+                    
+                    // 브로드캐스트 또는 목적지 못 찾음 -> Flooding
+                    if (current_dest_mac == BROADCAST_ADDR) begin
+                        fwd_state <= S_FLOOD;
+                        flood_port_idx <= 0;
+                    end else begin
+                        fwd_state <= S_FORWARD;
+                    end
+                end
+                
+                S_FORWARD: begin
+                    // Unicast 포워딩
+                    if (dest_found_reg) begin
+                        if (dest_port_reg != current_src_port) begin
+                            fifo_wr_en[dest_port_reg] <= 1;
+                            fifo_wr_data[dest_port_reg] <= current_frame;
+                        end
+                        // Filtering: 목적지가 소스와 같으면 아무것도 안 함
+                        // 포워딩 완료, 입력 큐 비우고 다음 포트로
+                        input_queue_valid[current_src_port] <= 0;
+                        rr_current_port <= (rr_current_port + 1) % NUM_PORTS;
+                        fwd_state <= S_IDLE;
+                    end else begin
+                        // 목적지 못 찾음 -> Flooding으로 전환
+                        fwd_state <= S_FLOOD;
+                        flood_port_idx <= 0;
+                    end
+                end
+                
+                S_FLOOD: begin
+                    // Flooding: 소스 포트 제외 모든 포트에 순차적으로 전송
+                    if (flood_port_idx != current_src_port) begin
+                        fifo_wr_en[flood_port_idx] <= 1;
+                        fifo_wr_data[flood_port_idx] <= current_frame;
+                    end
+                    
+                    if (flood_port_idx == NUM_PORTS - 1) begin
+                        // Flooding 완료, 입력 큐 비우고 다음 포트로
+                        input_queue_valid[current_src_port] <= 0;
+                        rr_current_port <= (rr_current_port + 1) % NUM_PORTS;
+                        fwd_state <= S_IDLE;
+                    end else begin
+                        flood_port_idx <= flood_port_idx + 1;
+                    end
+                end
+            endcase
         end
     end
 endmodule
