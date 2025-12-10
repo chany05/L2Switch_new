@@ -31,7 +31,7 @@ module FPGA_Simulator_Top (
 );
 
     // 시스템 리셋 (Active-Low 버튼)
-    wire sys_rst = ~FPGA_RST_BTN;
+    wire sys_rst = FPGA_RST_BTN;
 
     // ---------------------------------------------------------------------
     // 파라미터 및 상수 정의
